@@ -6,7 +6,7 @@ import os
 import time
 
 # --- Configuration & Hyperparameters ---
-IMG_SIZE = 256          # Target resolution (e.g., 256 or 512)
+IMG_SIZE = 256          # Target resolution
 CHANNELS = 3            # RGB images
 LATENT_DIM = 100        # Size of the random noise vector
 BATCH_SIZE = 32         # Batch size for training
@@ -41,14 +41,18 @@ except ImportError:
 
 def load_and_preprocess_image(path, label):
     """
-    Loads an image from a file path, decodes it, resizes it using high-quality interpolation,
+    Loads an image from a file path, decodes it, resizes it,
     and normalizes pixel values to the range [-1, 1].
     """
     img = tf.io.read_file(path)
     img = tf.image.decode_png(img, channels=CHANNELS)
-    # Use BICUBIC interpolation for better quality resizing
+
+    # Use high-quality interpolation for resizing
     img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE], method='bicubic')
-    img = (img - 127.5) / 127.5  # Normalize to [-1, 1]
+
+    # Normalize to [-1, 1] for Tanh activation in Generator
+    img = (img / 127.5) - 1.0
+
     return img, label
 
 def augment_image(img, label):
@@ -81,67 +85,68 @@ def create_dataset():
 
 def build_generator():
     """
-    Builds the Conditional Generator model using UpSampling2D + Conv2D
-    to reduce checkerboard artifacts and improve quality.
+    Builds the Conditional Generator model using UpSampling2D (bilinear) + Conv2D
+    to strictly eliminate checkerboard artifacts.
     """
     noise_input = Input(shape=(LATENT_DIM,), name='noise_input')
     label_input = Input(shape=(1,), name='label_input')
 
-    # Calculate starting dimension based on 5 upsampling steps (2^5 = 32)
-    # For IMG_SIZE=256, start_dim is 8 (8 -> 16 -> 32 -> 64 -> 128 -> 256)
+    # Start from 8x8 resolution
     start_dim = IMG_SIZE // 32
+    n_nodes = start_dim * start_dim * 256
 
     # Process Label
     label_embedding = layers.Dense(start_dim * start_dim * 1)(label_input)
     label_embedding = layers.Reshape((start_dim, start_dim, 1))(label_embedding)
 
     # Process Noise
-    noise_embedding = layers.Dense(start_dim * start_dim * 256)(noise_input)
+    noise_embedding = layers.Dense(n_nodes)(noise_input)
     noise_embedding = layers.Reshape((start_dim, start_dim, 256))(noise_embedding)
 
     x = layers.Concatenate()([noise_embedding, label_embedding])
 
     # --- Upsampling Blocks (UpSampling2D + Conv2D) ---
 
-    # Block 1: start_dim -> start_dim*2 (e.g., 8 -> 16)
-    x = layers.UpSampling2D(size=(2, 2))(x)
+    # Block 1: 8 -> 16
+    x = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(x)
     x = layers.Conv2D(256, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
 
     # Block 2: 16 -> 32
-    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(x)
     x = layers.Conv2D(128, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
 
     # Block 3: 32 -> 64
-    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(x)
     x = layers.Conv2D(64, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
 
     # Block 4: 64 -> 128
-    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(x)
     x = layers.Conv2D(32, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
 
     # Block 5: 128 -> 256
-    x = layers.UpSampling2D(size=(2, 2))(x)
-    x = layers.Conv2D(16, (3, 3), padding='same', use_bias=False)(x) # Reduced filters slightly
+    x = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(x)
+    x = layers.Conv2D(16, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
 
     # Output Layer
-    x = layers.Conv2D(CHANNELS, (3, 3), padding='same', use_bias=False)(x)
-    output = layers.Activation('tanh')(x)
+    # Ensures output is strictly in [-1, 1]
+    x = layers.Conv2D(CHANNELS, (3, 3), padding='same', activation='tanh')(x)
 
-    return models.Model([noise_input, label_input], output, name="Generator")
+    return models.Model([noise_input, label_input], x, name="Generator")
 
 def build_discriminator():
     """
-    Builds the Conditional Discriminator model with increased depth for high resolution.
+    Builds the Conditional Discriminator model with increased stability measures
+    (Dropout, LeakyReLU) to prevent overpowering the generator.
     """
     img_input = Input(shape=(IMG_SIZE, IMG_SIZE, CHANNELS), name='image_input')
     label_input = Input(shape=(1,), name='label_input')
@@ -153,33 +158,33 @@ def build_discriminator():
     x = layers.Concatenate()([img_input, label_channel])
 
     # --- Downsampling Blocks ---
-    # Block 1: 256 -> 128
+    # Block 1
     x = layers.Conv2D(64, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 2: 128 -> 64
+    # Block 2
     x = layers.Conv2D(128, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 3: 64 -> 32
+    # Block 3
     x = layers.Conv2D(256, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 4: 32 -> 16
+    # Block 4
     x = layers.Conv2D(512, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 5: 16 -> 8
+    # Block 5
     x = layers.Conv2D(512, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
     x = layers.Flatten()(x)
-    output = layers.Dense(1)(x)
+    output = layers.Dense(1)(x) # Logits output
 
     return models.Model([img_input, label_input], output, name="Discriminator")
 
@@ -188,13 +193,18 @@ def build_discriminator():
 cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
 def discriminator_loss(real_output, fake_output):
-    real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+    # One-sided label smoothing for real images:
+    # Instead of all 1s, use random values between 0.9 and 1.0
+    real_labels = tf.random.uniform(shape=tf.shape(real_output), minval=0.9, maxval=1.0)
+    real_loss = cross_entropy(real_labels, real_output)
+
     fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
     return real_loss + fake_loss
 
 def generator_loss(fake_output):
     return cross_entropy(tf.ones_like(fake_output), fake_output)
 
+# Stability: Use Adam with beta_1=0.5 for both
 generator_optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, beta_1=BETA_1)
 discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, beta_1=BETA_1)
 
@@ -224,25 +234,20 @@ def train_step(images, labels, generator, discriminator):
 def generate_and_save_images(model, epoch, test_input, test_labels, save_dir=GENERATED_SAMPLES_DIR):
     """
     Generates images and saves them as individual high-quality PNG files.
-    Filename format: generated_ph_<ph>_epoch_<epoch>.png
     """
-    # Ensure test_labels is a tensor
     if not isinstance(test_labels, tf.Tensor):
         test_labels = tf.constant(test_labels)
 
     predictions = model([test_input, test_labels], training=False)
 
-    # Rescale to [0, 255]
+    # Rescale from [-1, 1] to [0, 255]
     predictions = (predictions + 1) * 127.5
     predictions = tf.clip_by_value(predictions, 0, 255)
 
-    # Save each image individually
     for i in range(predictions.shape[0]):
         ph_val = float(test_labels[i, 0])
         filename = f"generated_ph_{ph_val:.1f}_epoch_{epoch}.png"
         save_path = os.path.join(save_dir, filename)
-
-        # Use tf.keras.utils.save_img for high quality saving
         tf.keras.utils.save_img(save_path, predictions[i])
 
     print(f"Saved {predictions.shape[0]} individual images to {save_dir}")
@@ -250,6 +255,7 @@ def generate_and_save_images(model, epoch, test_input, test_labels, save_dir=GEN
 # --- Main Execution ---
 
 if __name__ == "__main__":
+    # Initialize models
     generator = build_generator()
     discriminator = build_discriminator()
 
@@ -257,14 +263,30 @@ if __name__ == "__main__":
     generator.summary()
     discriminator.summary()
 
+    # Load dataset
     dataset = create_dataset()
 
     if dataset is None:
         print("Dataset creation failed. Exiting training setup.")
     else:
+        # --- Explicit Data Pipeline Verification (Crucial) ---
+        print("\n--- Verifying Data Normalization ---")
+        try:
+            sample_batch, _ = next(iter(dataset.take(1)))
+            min_val = tf.reduce_min(sample_batch).numpy()
+            max_val = tf.reduce_max(sample_batch).numpy()
+            print(f"Sample Batch Min Pixel Value: {min_val:.4f} (Expected close to -1.0)")
+            print(f"Sample Batch Max Pixel Value: {max_val:.4f} (Expected close to 1.0)")
+
+            if min_val < -1.2 or max_val > 1.2:
+                 print("WARNING: Data normalization might be incorrect!")
+        except Exception as e:
+            print(f"Data verification failed: {e}")
+        print("------------------------------------\n")
+
+        # Seed for consistent visualization
         num_examples_to_generate = 16
         seed_noise = tf.random.normal([num_examples_to_generate, LATENT_DIM])
-        # Generate random pH labels and convert to tf.constant
         seed_labels_np = np.random.uniform(4.0, 8.0, (num_examples_to_generate, 1)).astype(np.float32)
         seed_labels = tf.constant(seed_labels_np)
 
@@ -292,7 +314,7 @@ if __name__ == "__main__":
             if (epoch + 1) % 50 == 0:
                 generate_and_save_images(generator, epoch + 1, seed_noise, seed_labels)
 
-        # Save the final generator model
+        # Save the final model
         model_save_path = os.path.join(SAVED_MODELS_DIR, 'cgan_generator.h5')
         generator.save(model_save_path)
         print(f"Final generator model saved to {model_save_path}")
