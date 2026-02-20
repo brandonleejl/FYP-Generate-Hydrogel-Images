@@ -193,7 +193,11 @@ def build_discriminator():
 cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
 def discriminator_loss(real_output, fake_output):
-    real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+    # One-sided label smoothing for real images:
+    # Instead of all 1s, use random values between 0.9 and 1.0
+    real_labels = tf.random.uniform(shape=tf.shape(real_output), minval=0.9, maxval=1.0)
+    real_loss = cross_entropy(real_labels, real_output)
+
     fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
     return real_loss + fake_loss
 
@@ -251,6 +255,7 @@ def generate_and_save_images(model, epoch, test_input, test_labels, save_dir=GEN
 # --- Main Execution ---
 
 if __name__ == "__main__":
+    # Initialize models
     generator = build_generator()
     discriminator = build_discriminator()
 
@@ -258,11 +263,28 @@ if __name__ == "__main__":
     generator.summary()
     discriminator.summary()
 
+    # Load dataset
     dataset = create_dataset()
 
     if dataset is None:
         print("Dataset creation failed. Exiting training setup.")
     else:
+        # --- Explicit Data Pipeline Verification (Crucial) ---
+        print("\n--- Verifying Data Normalization ---")
+        try:
+            sample_batch, _ = next(iter(dataset.take(1)))
+            min_val = tf.reduce_min(sample_batch).numpy()
+            max_val = tf.reduce_max(sample_batch).numpy()
+            print(f"Sample Batch Min Pixel Value: {min_val:.4f} (Expected close to -1.0)")
+            print(f"Sample Batch Max Pixel Value: {max_val:.4f} (Expected close to 1.0)")
+
+            if min_val < -1.2 or max_val > 1.2:
+                 print("WARNING: Data normalization might be incorrect!")
+        except Exception as e:
+            print(f"Data verification failed: {e}")
+        print("------------------------------------\n")
+
+        # Seed for consistent visualization
         num_examples_to_generate = 16
         seed_noise = tf.random.normal([num_examples_to_generate, LATENT_DIM])
         seed_labels_np = np.random.uniform(4.0, 8.0, (num_examples_to_generate, 1)).astype(np.float32)
@@ -288,13 +310,16 @@ if __name__ == "__main__":
 
             print(f'Time for epoch {epoch + 1} is {time.time()-start:.2f} sec - Gen Loss: {gen_loss_avg:.4f}, Disc Loss: {disc_loss_avg:.4f}')
 
+            # Save generated images every 50 epochs
             if (epoch + 1) % 50 == 0:
                 generate_and_save_images(generator, epoch + 1, seed_noise, seed_labels)
 
+        # Save the final model
         model_save_path = os.path.join(SAVED_MODELS_DIR, 'cgan_generator.h5')
         generator.save(model_save_path)
         print(f"Final generator model saved to {model_save_path}")
 
+        # Generate final batch of samples
         print("Generating final batch of samples...")
         generate_and_save_images(generator, EPOCHS, seed_noise, seed_labels)
 
