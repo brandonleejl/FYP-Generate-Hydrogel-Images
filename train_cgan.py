@@ -2,18 +2,17 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, Input
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import os
 import time
 
 # --- Configuration & Hyperparameters ---
-IMG_SIZE = 256
-CHANNELS = 3
-LATENT_DIM = 100
-BATCH_SIZE = 32
-EPOCHS = 1000
-LEARNING_RATE = 0.0002
-BETA_1 = 0.5
+IMG_SIZE = 256          # Target resolution (e.g., 256 or 512)
+CHANNELS = 3            # RGB images
+LATENT_DIM = 100        # Size of the random noise vector
+BATCH_SIZE = 32         # Batch size for training
+EPOCHS = 1000           # Total number of training epochs
+LEARNING_RATE = 0.0002  # Adam learning rate
+BETA_1 = 0.5            # Adam beta_1 parameter
 
 # --- Paths (Google Drive Integration) ---
 BASE_PATH = '/content/drive/MyDrive/FYP_Hydrogel_Data'
@@ -42,12 +41,13 @@ except ImportError:
 
 def load_and_preprocess_image(path, label):
     """
-    Loads an image from a file path, decodes it, resizes it,
+    Loads an image from a file path, decodes it, resizes it using high-quality interpolation,
     and normalizes pixel values to the range [-1, 1].
     """
     img = tf.io.read_file(path)
-    img = tf.image.decode_png(img, channels=CHANNELS)  # Updated to PNG
-    img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
+    img = tf.image.decode_png(img, channels=CHANNELS)
+    # Use BICUBIC interpolation for better quality resizing
+    img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE], method='bicubic')
     img = (img - 127.5) / 127.5  # Normalize to [-1, 1]
     return img, label
 
@@ -81,11 +81,14 @@ def create_dataset():
 
 def build_generator():
     """
-    Builds the Conditional Generator model.
+    Builds the Conditional Generator model using UpSampling2D + Conv2D
+    to reduce checkerboard artifacts and improve quality.
     """
     noise_input = Input(shape=(LATENT_DIM,), name='noise_input')
     label_input = Input(shape=(1,), name='label_input')
 
+    # Calculate starting dimension based on 5 upsampling steps (2^5 = 32)
+    # For IMG_SIZE=256, start_dim is 8 (8 -> 16 -> 32 -> 64 -> 128 -> 256)
     start_dim = IMG_SIZE // 32
 
     # Process Label
@@ -98,54 +101,80 @@ def build_generator():
 
     x = layers.Concatenate()([noise_embedding, label_embedding])
 
-    # Upsampling Blocks
-    x = layers.Conv2DTranspose(256, (4, 4), strides=(2, 2), padding='same', use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
+    # --- Upsampling Blocks (UpSampling2D + Conv2D) ---
 
-    x = layers.Conv2DTranspose(128, (4, 4), strides=(2, 2), padding='same', use_bias=False)(x)
+    # Block 1: start_dim -> start_dim*2 (e.g., 8 -> 16)
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(256, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
+    x = layers.LeakyReLU(alpha=0.2)(x)
 
-    x = layers.Conv2DTranspose(64, (4, 4), strides=(2, 2), padding='same', use_bias=False)(x)
+    # Block 2: 16 -> 32
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(128, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
+    x = layers.LeakyReLU(alpha=0.2)(x)
 
-    x = layers.Conv2DTranspose(32, (4, 4), strides=(2, 2), padding='same', use_bias=False)(x)
+    # Block 3: 32 -> 64
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(64, (3, 3), padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
+    x = layers.LeakyReLU(alpha=0.2)(x)
 
-    x = layers.Conv2DTranspose(3, (4, 4), strides=(2, 2), padding='same', use_bias=False)(x)
+    # Block 4: 64 -> 128
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(32, (3, 3), padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU(alpha=0.2)(x)
+
+    # Block 5: 128 -> 256
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(16, (3, 3), padding='same', use_bias=False)(x) # Reduced filters slightly
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU(alpha=0.2)(x)
+
+    # Output Layer
+    x = layers.Conv2D(CHANNELS, (3, 3), padding='same', use_bias=False)(x)
     output = layers.Activation('tanh')(x)
 
     return models.Model([noise_input, label_input], output, name="Generator")
 
 def build_discriminator():
     """
-    Builds the Conditional Discriminator model.
+    Builds the Conditional Discriminator model with increased depth for high resolution.
     """
     img_input = Input(shape=(IMG_SIZE, IMG_SIZE, CHANNELS), name='image_input')
     label_input = Input(shape=(1,), name='label_input')
 
+    # Project label to match image spatial dimensions
     label_embedding = layers.Dense(IMG_SIZE * IMG_SIZE)(label_input)
     label_channel = layers.Reshape((IMG_SIZE, IMG_SIZE, 1))(label_embedding)
 
     x = layers.Concatenate()([img_input, label_channel])
 
-    # Downsampling Blocks
-    x = layers.Conv2D(64, (4, 4), strides=(2, 2), padding='same')(x)
+    # --- Downsampling Blocks ---
+    # Block 1: 256 -> 128
+    x = layers.Conv2D(64, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    x = layers.Conv2D(128, (4, 4), strides=(2, 2), padding='same')(x)
+    # Block 2: 128 -> 64
+    x = layers.Conv2D(128, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    x = layers.Conv2D(256, (4, 4), strides=(2, 2), padding='same')(x)
+    # Block 3: 64 -> 32
+    x = layers.Conv2D(256, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    x = layers.Conv2D(512, (4, 4), strides=(2, 2), padding='same')(x)
+    # Block 4: 32 -> 16
+    x = layers.Conv2D(512, (3, 3), strides=(2, 2), padding='same')(x)
+    x = layers.LeakyReLU(alpha=0.2)(x)
+    x = layers.Dropout(0.3)(x)
+
+    # Block 5: 16 -> 8
+    x = layers.Conv2D(512, (3, 3), strides=(2, 2), padding='same')(x)
     x = layers.LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
 
@@ -192,9 +221,10 @@ def train_step(images, labels, generator, discriminator):
 
     return gen_loss, disc_loss
 
-def generate_and_save_images(model, epoch, test_input, test_labels, save_dir=GENERATED_SAMPLES_DIR, prefix='image_at_epoch'):
+def generate_and_save_images(model, epoch, test_input, test_labels, save_dir=GENERATED_SAMPLES_DIR):
     """
-    Generates a grid of images for visualization and saves to the specified directory.
+    Generates images and saves them as individual high-quality PNG files.
+    Filename format: generated_ph_<ph>_epoch_<epoch>.png
     """
     # Ensure test_labels is a tensor
     if not isinstance(test_labels, tf.Tensor):
@@ -202,25 +232,20 @@ def generate_and_save_images(model, epoch, test_input, test_labels, save_dir=GEN
 
     predictions = model([test_input, test_labels], training=False)
 
-    fig = plt.figure(figsize=(10, 10))
-    predictions = (predictions + 1) / 2.0
+    # Rescale to [0, 255]
+    predictions = (predictions + 1) * 127.5
+    predictions = tf.clip_by_value(predictions, 0, 255)
 
+    # Save each image individually
     for i in range(predictions.shape[0]):
-        plt.subplot(4, 4, i+1)
-        plt.imshow(predictions[i])
-        plt.title(f"pH: {test_labels[i, 0]:.1f}")
-        plt.axis('off')
+        ph_val = float(test_labels[i, 0])
+        filename = f"generated_ph_{ph_val:.1f}_epoch_{epoch}.png"
+        save_path = os.path.join(save_dir, filename)
 
-    if prefix == 'final_samples':
-        filename = f"{prefix}.png"
-    else:
-        filename = '{}_{:04d}.png'.format(prefix, epoch)
+        # Use tf.keras.utils.save_img for high quality saving
+        tf.keras.utils.save_img(save_path, predictions[i])
 
-    save_path = os.path.join(save_dir, filename)
-    plt.savefig(save_path)
-    plt.close()
-    print(f"Saved sample grid to {save_path}")
-    return save_path
+    print(f"Saved {predictions.shape[0]} individual images to {save_dir}")
 
 # --- Main Execution ---
 
@@ -263,6 +288,7 @@ if __name__ == "__main__":
 
             print(f'Time for epoch {epoch + 1} is {time.time()-start:.2f} sec - Gen Loss: {gen_loss_avg:.4f}, Disc Loss: {disc_loss_avg:.4f}')
 
+            # Save generated images every 50 epochs
             if (epoch + 1) % 50 == 0:
                 generate_and_save_images(generator, epoch + 1, seed_noise, seed_labels)
 
@@ -273,7 +299,7 @@ if __name__ == "__main__":
 
         # Generate final batch of samples
         print("Generating final batch of samples...")
-        final_save_path = generate_and_save_images(generator, EPOCHS, seed_noise, seed_labels, prefix='final_samples')
+        generate_and_save_images(generator, EPOCHS, seed_noise, seed_labels)
 
         print("\n" + "="*50)
         print(f"TRAINING COMPLETE. Generated images saved to:\n{GENERATED_SAMPLES_DIR}")
